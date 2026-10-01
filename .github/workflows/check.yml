@@ -1,0 +1,46 @@
+name: Riftbound gallery watcher
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes (GitHub may delay runs a bit)
+  workflow_dispatch:
+    inputs:
+      list_only:
+        description: "Test mode: only print the cards found, post nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # lets the workflow save which cards it has already seen
+
+concurrency:
+  group: riftbound-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright requests
+          playwright install --with-deps chromium
+
+      - name: Check the gallery
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python riftbound_gallery_watcher.py ${{ inputs.list_only && '--list' || '--once' }}
+
+      - name: Save seen cards
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add gallery_state.json || true
+          git diff --cached --quiet || (git commit -m "Update seen cards" && git push)
