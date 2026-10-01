@@ -38,7 +38,7 @@ SELECTOR = os.environ.get("CARD_SELECTOR", "main img")
 POLL = int(os.environ.get("POLL_SECONDS", "1800"))
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
 STATE_FILE = "gallery_state.json"
-SKIP_WORDS = ("riotbar", "logo", "icon", "sprite", "avatar", ".svg")
+SKIP_WORDS = ("riotbar", "logo", "icon", "sprite", "avatar", ".svg", "news_live")
 
 
 def scrape():
@@ -83,7 +83,11 @@ def post(new_cards):
     items = list(new_cards.items())
     for i in range(0, len(items), 10):
         embeds = [
-            {"title": name[:250], "image": {"url": src}, "color": 0xC89B3C}
+            {
+                "title": name[:250],
+                "image": {"url": src.replace("w=302", "w=744")},  # larger version
+                "color": 0xC89B3C,
+            }
             for src, name in items[i : i + 10]
         ]
         content = "New Riftbound cards revealed!" if i == 0 else None
@@ -101,8 +105,10 @@ def load_seen():
     try:
         with open(STATE_FILE) as f:
             return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
         return None
+    except json.JSONDecodeError:
+        raise RuntimeError(f"{STATE_FILE} is not valid JSON. Fix it or delete it to start over.")
 
 
 def check():
