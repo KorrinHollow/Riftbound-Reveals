@@ -2,6 +2,7 @@
 """
 Riftbound gallery watcher: opens the official card gallery in a headless browser,
 collects every card image, and posts newly appeared cards to a Discord webhook.
+Each new card is posted as its own separate message.
 Free: no API keys, no paid services.
 
 Setup:
@@ -79,26 +80,26 @@ def scrape():
 
 
 def post(new_cards):
-    """Post new cards to Discord, 10 embeds per message (Discord's limit)."""
-    items = list(new_cards.items())
-    for i in range(0, len(items), 10):
-        embeds = [
-            {
-                "title": name[:250],
-                "image": {"url": src.replace("w=302", "w=744")},  # larger version
-                "color": 0xC89B3C,
-            }
-            for src, name in items[i : i + 10]
-        ]
-        content = "New Riftbound cards revealed!" if i == 0 else None
+    """Post each new card to Discord as its own separate message."""
+    for src, name in new_cards.items():
+        payload = {
+            "content": "New Riftbound card revealed!",
+            "embeds": [
+                {
+                    "title": name[:250],
+                    "image": {"url": src.replace("w=302", "w=744")},  # larger version
+                    "color": 0xC89B3C,
+                }
+            ],
+        }
         while True:
-            r = requests.post(WEBHOOK, json={"content": content, "embeds": embeds}, timeout=30)
+            r = requests.post(WEBHOOK, json=payload, timeout=30)
             if r.status_code == 429:
                 time.sleep(float(r.json().get("retry_after", 2)))
                 continue
             r.raise_for_status()
             break
-        time.sleep(1)
+        time.sleep(1.5)  # stay under Discord's webhook rate limit
 
 
 def load_seen():
