@@ -3,31 +3,16 @@
 Riftbound gallery watcher: opens the official card gallery in a headless browser,
 collects every card image, and posts newly appeared cards to a Discord webhook.
 Each new card is posted as its own separate message.
-Free: no API keys, no paid services.
 
-Setup:
-  pip install playwright requests
-  playwright install chromium
+Test (posts nothing):   python riftbound_gallery_watcher.py --list
+Run for real:           python riftbound_gallery_watcher.py
+GitHub Actions:         python riftbound_gallery_watcher.py --once
 
-Step 1 - test what it can see (does not post anything):
-  python riftbound_gallery_watcher.py --list
-
-Step 2 - run for real:
-  export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
-  python riftbound_gallery_watcher.py
-
-The first real run saves all current cards as a baseline and posts nothing.
-After that, any card that newly appears gets posted.
-
-Optional env vars:
-  GALLERY_URL      default https://playriftbound.com/en-us/card-gallery/
-  CARD_SELECTOR    CSS selector for card images (default: "main img"). If --list
-                   shows junk or misses cards, inspect a card image in your browser
-                   and set a tighter selector, e.g. "img[alt]" or ".card-grid img".
-  POLL_SECONDS     default 1800 (30 min)
+Optional env vars: GALLERY_URL, CARD_SELECTOR, POLL_SECONDS, DISCORD_WEBHOOK_URL
 """
 import json
 import os
+import re
 import sys
 import time
 
@@ -41,41 +26,69 @@ WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
 STATE_FILE = "gallery_state.json"
 SKIP_WORDS = ("riotbar", "logo", "icon", "sprite", "avatar", ".svg", "news_live")
 
+GRAB_JS = """els => els.map(e => ({
+    src: e.currentSrc || e.src || '',
+    alt: e.alt || '',
+    w: e.naturalWidth || 0
+}))"""
+
 
 def scrape():
     """Return {image_url: card_name} for every card image found on the gallery."""
+    raw = {}  # src -> (alt, width), collected on every scroll step
+
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 1400, "height": 1000})
         page.goto(URL, wait_until="networkidle", timeout=60000)
 
-        # Scroll until no new images load (handles lazy loading / infinite scroll)
-        last_count, stable = -1, 0
-        while stable < 3:
-            page.mouse.wheel(0, 4000)
-            page.wait_for_timeout(1200)
-            count = page.eval_on_selector_all(SELECTOR, "els => els.length")
-            stable = stable + 1 if count == last_count else 0
-            last_count = count
+        def collect():
+            for it in page.eval_on_selector_all(SELECTOR, GRAB_JS):
+                if it["src"] and it["src"] not in raw:
+                    raw[it["src"]] = (it["alt"], it["w"])
 
-        items = page.eval_on_selector_all(
-            SELECTOR,
-            """els => els.map(e => ({
-                src: e.currentSrc || e.src || '',
-                alt: e.alt || '',
-                w: e.naturalWidth || 0
-            }))""",
-        )
+        stable = 0
+        last_total = -1
+        for _ in range(300):  # hard cap so it can never loop forever
+            collect()
+
+            # click any "load more" style button
+            try:
+                btn = page.get_by_role("button", name=re.compile(r"(load|show|view) more", re.I))
+                if btn.count() and btn.first.is_visible():
+                    btn.first.click()
+            except Exception:
+                pass
+
+            page.evaluate("window.scrollBy(0, 1500)")
+            page.mouse.wheel(0, 1500)
+            page.wait_for_timeout(900)
+
+            at_bottom = page.evaluate(
+                "window.innerHeight + window.scrollY >= document.body.scrollHeight - 5"
+            )
+            if len(raw) == last_total and at_bottom:
+                stable += 1
+                if stable >= 6:
+                    break
+            else:
+                stable = 0
+            last_total = len(raw)
+
+        collect()
         browser.close()
 
-    cards = {}
-    for it in items:
-        src = it["src"]
-        if not src.startswith("http") or any(w in src.lower() for w in SKIP_WORDS):
+    cards, skipped = {}, 0
+    for src, (alt, w) in raw.items():
+        if not src.startswith("http") or any(word in src.lower() for word in SKIP_WORDS):
+            skipped += 1
             continue
-        if it["w"] and it["w"] < 120:  # skip tiny images
+        if w and w < 120:  # skip tiny images
+            skipped += 1
             continue
-        cards[src] = it["alt"] or src.rsplit("/", 1)[-1]
+        cards[src] = alt or src.rsplit("/", 1)[-1]
+
+    print(f"Scraped {len(raw)} images total, kept {len(cards)} as cards, skipped {skipped}.")
     return cards
 
 
@@ -121,11 +134,13 @@ def check():
         print(f"Baseline saved: {len(cards)} cards (nothing posted).")
         json.dump(sorted(cards), open(STATE_FILE, "w"))
         return
-    new = {s: n for s, n in cards.items() if s not in set(seen)}
+    seen_set = set(seen)
+    print(f"Previously seen: {len(seen_set)} cards.")
+    new = {s: n for s, n in cards.items() if s not in seen_set}
     if new:
         print(f"{len(new)} new cards, posting...")
         post(new)
-        json.dump(sorted(set(seen) | set(cards)), open(STATE_FILE, "w"))
+        json.dump(sorted(seen_set | set(cards)), open(STATE_FILE, "w"))
     else:
         print("No new cards.")
 
@@ -134,10 +149,8 @@ def main():
     if "--list" in sys.argv:
         cards = scrape()
         print(f"Found {len(cards)} card images with selector {SELECTOR!r}:\n")
-        for src, name in list(cards.items())[:25]:
+        for src, name in list(cards.items())[-25:]:
             print(f"  {name}\n    {src}")
-        if len(cards) > 25:
-            print(f"  ... and {len(cards) - 25} more")
         if not cards:
             print("Nothing found. Try a different CARD_SELECTOR.")
         return
