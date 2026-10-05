@@ -1,30 +1,29 @@
-name: Riftbound gallery watcher
+name: Riftbound Watcher
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes (GitHub may delay runs a bit)
+    - cron: "*/30 * * * *"
   workflow_dispatch:
-    inputs:
-      list_only:
-        description: "Test mode: only print the cards found, post nothing"
-        type: boolean
-        default: false
 
-permissions:
-  contents: write   # lets the workflow save which cards it has already seen
-
+# Prevents two runs from overlapping and racing each other's pushes
 concurrency:
-  group: riftbound-watch
+  group: riftbound-watcher
   cancel-in-progress: false
+
+# Lets the job push gallery_state.json back to the repo
+permissions:
+  contents: write
 
 jobs:
   check:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
@@ -33,14 +32,26 @@ jobs:
           pip install playwright requests
           playwright install --with-deps chromium
 
-      - name: Check the gallery
+      - name: Run watcher
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python riftbound_gallery_watcher.py ${{ inputs.list_only && '--list' || '--once' }}
+        run: python riftbound_gallery_watcher.py --once
 
       - name: Save seen cards
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
-          git add gallery_state.json || true
-          git diff --cached --quiet || (git commit -m "Update seen cards" && git push)
+          git add gallery_state.json
+          if git diff --staged --quiet; then
+            echo "No changes to save"
+            exit 0
+          fi
+          git commit -m "Update seen cards"
+          for i in 1 2 3; do
+            if git pull --rebase -X theirs origin main && git push; then
+              exit 0
+            fi
+            echo "Push failed, retrying ($i/3)..."
+            sleep 3
+          done
+          exit 1
