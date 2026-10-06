@@ -38,7 +38,12 @@ jobs:
         run: python riftbound_gallery_watcher.py --once
 
       - name: Save seen cards
+        if: always()
         run: |
+          if [ ! -f gallery_state.json ]; then
+            echo "No state file to save"
+            exit 0
+          fi
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
           git add gallery_state.json
@@ -48,7 +53,7 @@ jobs:
           fi
           git commit -m "Update seen cards"
           for i in 1 2 3; do
-            if git pull --rebase -X theirs origin main && git push; then
+            if git pull --rebase -X theirs origin "${{ github.ref_name }}" && git push; then
               exit 0
             fi
             echo "Push failed, retrying ($i/3)..."
