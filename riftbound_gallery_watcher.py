@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -26,6 +27,9 @@ WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
 STATE_FILE = "gallery_state.json"
 SKIP_WORDS = ("riotbar", "logo", "icon", "sprite", "avatar", ".svg", "news_live")
 
+# query params that change the rendering, not the card identity
+IGNORE_PARAMS = {"w", "h", "q", "fm", "auto", "dpr", "fit", "v", "t", "cb"}
+
 GRAB_JS = """els => els.map(e => ({
     src: e.currentSrc || e.src || '',
     alt: e.alt || '',
@@ -33,8 +37,15 @@ GRAB_JS = """els => els.map(e => ({
 }))"""
 
 
+def norm(url):
+    """Stable identity for an image URL: drops size/cache params and fragments."""
+    u = urlsplit(url)
+    q = [(k, v) for k, v in parse_qsl(u.query) if k.lower() not in IGNORE_PARAMS]
+    return urlunsplit((u.scheme, u.netloc, u.path, urlencode(q), ""))
+
+
 def scrape():
-    """Return {image_url: card_name} for every card image found on the gallery."""
+    """Return {normalized_key: (image_url, card_name)} for every card image found."""
     raw = {}  # src -> (alt, width), collected on every scroll step
 
     with sync_playwright() as p:
@@ -78,7 +89,7 @@ def scrape():
         collect()
         browser.close()
 
-    cards, skipped = {}, 0
+    cards, skipped = {}, 0  # norm_key -> (src, name)
     for src, (alt, w) in raw.items():
         if not src.startswith("http") or any(word in src.lower() for word in SKIP_WORDS):
             skipped += 1
@@ -86,33 +97,34 @@ def scrape():
         if w and w < 120:  # skip tiny images
             skipped += 1
             continue
-        cards[src] = alt or src.rsplit("/", 1)[-1]
+        key = norm(src)
+        if key not in cards:  # collapses the same card seen at different sizes
+            cards[key] = (src, alt or src.rsplit("/", 1)[-1])
 
-    print(f"Scraped {len(raw)} images total, kept {len(cards)} as cards, skipped {skipped}.")
+    print(f"Scraped {len(raw)} images total, kept {len(cards)} unique cards, skipped {skipped}.")
     return cards
 
 
-def post(new_cards):
-    """Post each new card to Discord as its own separate message."""
-    for src, name in new_cards.items():
-        payload = {
-            "content": "New Riftbound card revealed!",
-            "embeds": [
-                {
-                    "title": name[:250],
-                    "image": {"url": src.replace("w=302", "w=744")},  # larger version
-                    "color": 0xC89B3C,
-                }
-            ],
-        }
-        while True:
-            r = requests.post(WEBHOOK, json=payload, timeout=30)
-            if r.status_code == 429:
-                time.sleep(float(r.json().get("retry_after", 2)))
-                continue
-            r.raise_for_status()
-            break
-        time.sleep(1.5)  # stay under Discord's webhook rate limit
+def post_one(src, name):
+    """Post a single card to Discord as its own message."""
+    payload = {
+        "content": "New Riftbound card revealed!",
+        "embeds": [
+            {
+                "title": name[:250],
+                "image": {"url": src.replace("w=302", "w=744")},  # larger version
+                "color": 0xC89B3C,
+            }
+        ],
+    }
+    while True:
+        r = requests.post(WEBHOOK, json=payload, timeout=30)
+        if r.status_code == 429:
+            time.sleep(float(r.json().get("retry_after", 2)))
+            continue
+        r.raise_for_status()
+        break
+    time.sleep(1.5)  # stay under Discord's webhook rate limit
 
 
 def load_seen():
@@ -125,31 +137,43 @@ def load_seen():
         raise RuntimeError(f"{STATE_FILE} is not valid JSON. Fix it or delete it to start over.")
 
 
+def save_state(keys):
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(sorted(keys), f)
+    os.replace(tmp, STATE_FILE)  # atomic, no half-written file
+
+
 def check():
     cards = scrape()
     if not cards:
         raise RuntimeError("Scrape returned nothing (page layout may have changed).")
     seen = load_seen()
     if seen is None:
+        save_state(cards.keys())
         print(f"Baseline saved: {len(cards)} cards (nothing posted).")
-        json.dump(sorted(cards), open(STATE_FILE, "w"))
         return
-    seen_set = set(seen)
+
+    # normalize old entries too, so an existing state file still matches
+    seen_set = {norm(s) for s in seen}
     print(f"Previously seen: {len(seen_set)} cards.")
-    new = {s: n for s, n in cards.items() if s not in seen_set}
-    if new:
-        print(f"{len(new)} new cards, posting...")
-        post(new)
-        json.dump(sorted(seen_set | set(cards)), open(STATE_FILE, "w"))
-    else:
+    new = {k: v for k, v in cards.items() if k not in seen_set}
+    if not new:
         print("No new cards.")
+        return
+
+    print(f"{len(new)} new cards, posting...")
+    for key, (src, name) in new.items():
+        post_one(src, name)
+        seen_set.add(key)
+        save_state(seen_set)  # saved after EACH post, so a crash never causes re-posts
 
 
 def main():
     if "--list" in sys.argv:
         cards = scrape()
         print(f"Found {len(cards)} card images with selector {SELECTOR!r}:\n")
-        for src, name in list(cards.items())[-25:]:
+        for key, (src, name) in list(cards.items())[-25:]:
             print(f"  {name}\n    {src}")
         if not cards:
             print("Nothing found. Try a different CARD_SELECTOR.")
